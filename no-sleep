@@ -1,9 +1,8 @@
 #!/bin/sh
-# no-sleep — keep a GNOME/systemd laptop awake (lid closed, idle, on battery)
-# until toggled off.
+# no-sleep — keep a laptop awake (lid closed, idle, on battery) until toggled off.
 #
-# TWO layers can put a GNOME/systemd machine to sleep, and each needs its own
-# inhibitor:
+# Linux (systemd + optional GNOME): TWO layers can put the machine to sleep,
+# and each needs its own inhibitor:
 #   1. systemd-logind's lid handling (HandleLidSwitch=suspend) — blocked by a
 #      logind *block* inhibitor on handle-lid-switch (+ sleep + idle).
 #   2. GNOME's idle auto-suspend (gsd-power, sleep-inactive-*-timeout) — this
@@ -12,23 +11,37 @@
 #      alone does NOT stop it. It does honor GNOME *session* inhibitors, so we
 #      also hold gnome-session-inhibit (falling back to plain tail on non-GNOME
 #      systems, where layer 1 is all there is).
+#   Both locks live in one process tree (systemd-inhibit wrapping
+#   gnome-session-inhibit); killing it releases everything, and the locks die
+#   with the login session — so it can't get stuck awake forever by accident.
+#   No sudo needed.
 #
-# Both locks live in one process tree (systemd-inhibit wrapping
-# gnome-session-inhibit); killing it releases everything, and the locks die
-# with the login session — so it can't get stuck awake forever by accident.
-# No sudo needed.
+# macOS: `caffeinate -i` blocks idle sleep and is process-tied (self-releasing,
+#   same philosophy). But lid-close sleep can only be blocked by root via
+#   `pmset disablesleep 1` — that is sticky system state, not process-tied, so
+#   `on` sets it (asking for sudo) and `off` restores it. If sudo is declined,
+#   you get an idle-only lock: the machine stays awake while the lid is open.
 #
 # usage:  no-sleep on | off    (no arg shows current state)
 
 G='\033[1;32m'; C='\033[1;36m'; Y='\033[1;33m'; D='\033[2m'; R='\033[0m'
 pidfile="${XDG_RUNTIME_DIR:-/tmp}/no-sleep.lock"
+mac=0; [ "$(uname -s)" = "Darwin" ] && mac=1
 
 pid=""
 [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null)
 alive=0
 [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=1
 
-registered() { systemd-inhibit --list 2>/dev/null | grep -q "no-sleep"; }
+registered() {
+    if [ "$mac" = 1 ]; then
+        pmset -g assertions 2>/dev/null | grep -q "caffeinate"
+    else
+        systemd-inhibit --list 2>/dev/null | grep -q "no-sleep"
+    fi
+}
+# macOS only: is the root-level lid-close block (pmset disablesleep) active?
+lid_blocked_mac() { pmset -g 2>/dev/null | grep -q "SleepDisabled[[:space:]]*1"; }
 
 case "${1:-status}" in
     on)
@@ -36,39 +49,75 @@ case "${1:-status}" in
             printf "${G}☕ no-sleep already ON${R}  (lock pid $pid)\n"
             exit 0
         fi
-        systemd-inhibit --what=handle-lid-switch:sleep:idle \
-            --who="no-sleep" --why="working with lid closed" \
-            --mode=block sh -c 'command -v gnome-session-inhibit >/dev/null 2>&1 \
-                && exec gnome-session-inhibit --app-id no-sleep --reason "working with lid closed" --inhibit suspend:idle --inhibit-only; \
-                exec tail -f /dev/null' >/dev/null 2>&1 &
+        lid=1
+        if [ "$mac" = 1 ]; then
+            printf "${D}macOS: blocking lid-close sleep needs root (pmset disablesleep 1)${R}\n"
+            sudo pmset -a disablesleep 1 2>/dev/null || lid=0
+            caffeinate -i >/dev/null 2>&1 &
+        else
+            systemd-inhibit --what=handle-lid-switch:sleep:idle \
+                --who="no-sleep" --why="working with lid closed" \
+                --mode=block sh -c 'command -v gnome-session-inhibit >/dev/null 2>&1 \
+                    && exec gnome-session-inhibit --app-id no-sleep --reason "working with lid closed" --inhibit suspend:idle --inhibit-only; \
+                    exec tail -f /dev/null' >/dev/null 2>&1 &
+        fi
         pid=$!
         echo "$pid" > "$pidfile"
         sleep 0.5
         if ! registered; then
-            printf "${Y}⚠ no-sleep FAILED${R} — inhibitor did not register (check: systemd-inhibit --list)\n"
+            printf "${Y}⚠ no-sleep FAILED${R} — inhibitor did not register"
+            if [ "$mac" = 1 ]; then
+                printf " (check: pmset -g assertions)\n"
+            else
+                printf " (check: systemd-inhibit --list)\n"
+            fi
             rm -f "$pidfile"
             exit 1
         fi
-        printf "${G}☕ no-sleep ON${R}  — close the lid and keep working.\n"
-        printf "${D}   • blocks lid-close suspend (logind) + GNOME idle auto-suspend\n"
+        if [ "$lid" = 1 ]; then
+            printf "${G}☕ no-sleep ON${R}  — close the lid and keep working.\n"
+        else
+            printf "${G}☕ no-sleep ON${R}  — idle sleep blocked.\n"
+            printf "${Y}   ⚠ lid-close sleep NOT blocked (sudo declined) — keep the lid open${R}\n"
+        fi
+        if [ "$mac" = 1 ]; then
+            printf "${D}   • blocks idle sleep (caffeinate)"
+            [ "$lid" = 1 ] && printf " + lid-close sleep (pmset disablesleep)"
+            printf "\n"
+        else
+            printf "${D}   • blocks lid-close suspend (logind) + GNOME idle auto-suspend\n"
+        fi
         printf "   • run 'no-sleep off' when you're done\n"
-        printf "   • heat builds in a closed bag; Super+L locks the screen first${R}\n"
+        printf "   • heat builds in a closed bag; lock the screen first${R}\n"
         ;;
     off)
         if [ -n "$pid" ]; then
             pkill -P "$pid" 2>/dev/null   # kill the lock-holding child
-            kill "$pid" 2>/dev/null       # kill systemd-inhibit → release lock
+            kill "$pid" 2>/dev/null       # kill the lock holder → release lock
         fi
         rm -f "$pidfile"
-        printf "${C}🌙 no-sleep OFF${R} — normal: lid-close and idle suspend again.\n"
+        if [ "$mac" = 1 ] && lid_blocked_mac; then
+            sudo pmset -a disablesleep 0 2>/dev/null \
+                || printf "${Y}⚠ could not restore lid-close sleep — run: sudo pmset -a disablesleep 0${R}\n"
+        fi
+        printf "${C}🌙 no-sleep OFF${R} — normal: lid-close and idle sleep again.\n"
         ;;
     status)
         if [ "$alive" = 1 ] && registered; then
-            printf "${G}☕ no-sleep is ON${R}  — lid-close + GNOME idle auto-suspend blocked (lock pid $pid).\n"
+            if [ "$mac" = 1 ]; then
+                lidmsg="lid-close sleep NOT blocked"
+                lid_blocked_mac && lidmsg="lid-close sleep blocked"
+                printf "${G}☕ no-sleep is ON${R}  — idle sleep blocked, $lidmsg (lock pid $pid).\n"
+            else
+                printf "${G}☕ no-sleep is ON${R}  — lid-close + GNOME idle auto-suspend blocked (lock pid $pid).\n"
+            fi
         elif [ "$alive" = 1 ]; then
             printf "${Y}⚠ no-sleep lock pid $pid is alive but no inhibitor is registered${R} — run 'no-sleep off' then 'no-sleep on'.\n"
         else
-            printf "${C}🌙 no-sleep is OFF${R} — normal suspend behavior.\n"
+            printf "${C}🌙 no-sleep is OFF${R} — normal sleep behavior.\n"
+            if [ "$mac" = 1 ] && lid_blocked_mac; then
+                printf "${Y}⚠ but pmset disablesleep is still 1 — run: sudo pmset -a disablesleep 0${R}\n"
+            fi
         fi
         ;;
     *)
